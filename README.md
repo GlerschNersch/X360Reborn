@@ -30,3 +30,7 @@ Then pick X360 Reborn under Settings → Apps → Default apps → Home app.
 
 `re/tools` holds the Python scripts used to read the update package (XEX2, XUIZ archives, STFS packages,
 XUI scene trees). They operate on files you supply yourself; no firmware is distributed here.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). This covers this repository's own code only; Xbox and the dashboard design belong to Microsoft.
