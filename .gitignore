@@ -1,0 +1,11 @@
+# Extracted Microsoft firmware data and third-party tools: reference only, never commit or ship
+re/out/
+re/bin/
+re/.venv/
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+__pycache__/

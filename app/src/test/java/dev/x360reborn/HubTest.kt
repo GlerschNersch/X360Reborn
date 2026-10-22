@@ -1,0 +1,121 @@
+package dev.x360reborn
+
+import dev.x360reborn.home.AppInfo
+import dev.x360reborn.home.Category
+import dev.x360reborn.home.HubBuilder
+import dev.x360reborn.home.Kind
+import dev.x360reborn.home.Layout
+import dev.x360reborn.home.TileSize
+import dev.x360reborn.home.Metrics
+import dev.x360reborn.home.Motion
+import dev.x360reborn.home.Nav
+import dev.x360reborn.home.SettingsEntry
+import dev.x360reborn.home.Target
+import dev.x360reborn.home.focusable
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class HubTest {
+    private val apps = (1..30).map { AppInfo("p$it/A", "App %02d".format(it), if (it <= 3) Category.GAME else Category.OTHER) }
+    private val settings = listOf(SettingsEntry("wi-fi", "x"))
+
+    @Test fun template1hdKeepsFourPixelGutters() {
+        val s = Metrics.HOME.slots
+        assertEquals(178f, s[1].x, 0f)
+        assertEquals(s[1].right + Metrics.GUTTER, s[2].x, 0f)
+        assertEquals(Metrics.HOME.h, s[8].bottom, 0f)
+        assertEquals(Metrics.HOME.w, s[8].right, 0f)
+    }
+
+    @Test fun channelsFollowDashOrderAndDropEmptyHubs() {
+        val hub = HubBuilder.build(apps, emptyList(), emptyList(), settings)
+        assertEquals(listOf("home", "games", "apps", "settings"), hub.channels.map { it.title })
+    }
+
+    @Test fun heroIsPinThenMostRecent() {
+        val hub = HubBuilder.build(apps, recent = listOf("p7/A", "p9/A"), pins = listOf("p20/A"), settings = settings)
+        val home = hub.pages[0]
+        assertEquals(Kind.HERO, home.tiles[home.template.hero].kind)
+        assertEquals(Target.App("p20/A"), home.tiles[home.template.hero].target)
+        assertEquals(Target.App("p7/A"), home.tiles[0].target)
+    }
+
+    @Test fun appsChannelPagesHoldFifteen() {
+        val hub = HubBuilder.build(apps, emptyList(), emptyList(), settings)
+        val ch = hub.channels.first { it.title == "apps" }
+        assertEquals(2, ch.pageCount)
+        assertEquals(15, hub.pages[ch.firstPage].tiles.size)
+    }
+
+    @Test fun navigationMovesAcrossTheHeroTile() {
+        val s = Metrics.HOME.slots
+        val all = { _: Int -> true }
+        assertEquals(1, Nav.move(s, all, 0, 1, 0))
+        assertEquals(2, Nav.move(s, all, 1, 1, 0))
+        assertEquals(-1, Nav.move(s, all, 0, 0, -1))
+        assertEquals(6, Nav.move(s, all, 1, 0, 1))
+        assertEquals(1, Nav.move(s, all, 4, -1, 0))
+    }
+
+    @Test fun emptySlotsAreSkipped() {
+        val hub = HubBuilder.build(apps.take(2), emptyList(), emptyList(), settings)
+        val home = hub.pages[0]
+        assertTrue(home.focusable(home.template.hero))
+        assertTrue(!home.focusable(8))
+    }
+
+    @Test fun portraitTemplatesFitAndDoNotOverlap() {
+        for ((w, h) in listOf(1272 to 2772, 1080 to 2400, 1080 to 1920)) for (size in TileSize.entries) {
+            val l = Layout.portrait(w, h, size)
+            assertEquals(size.portraitCols * Metrics.SMALL_W + (size.portraitCols - 1) * Metrics.GUTTER + 68f, l.w, 0.01f)
+            for (t in listOf(l.home, l.grid)) {
+                assertTrue("$w x $h $size", l.panelsY + t.h <= l.h)
+                assertTrue(t.w <= l.w)
+                for (a in t.slots.indices) for (b in t.slots.indices) if (a < b) {
+                    val p = t.slots[a]; val q = t.slots[b]
+                    assertTrue(p.right <= q.x || q.right <= p.x || p.bottom <= q.y || q.bottom <= p.y)
+                }
+            }
+            assertTrue(l.twistY >= 0f)
+        }
+    }
+
+    @Test fun smallerSizesFitMoreTiles() {
+        val counts = TileSize.entries.map { Layout.portrait(1272, 2772, it).grid.slots.size }
+        assertTrue(counts == counts.sorted() && counts.distinct().size == counts.size)
+        val land = TileSize.entries.map { Layout.landscape(2772, 1272, it).grid.slots.size }
+        assertEquals(15, land[0])
+        assertTrue(land == land.sorted() && land.last() > land.first())
+        assertEquals(TileSize.SMALL, TileSize.SMALL.smaller())
+        assertEquals(TileSize.LARGE, TileSize.SMALL.next())
+    }
+
+    @Test fun shortcutsFollowTheLastAppOnSparsePages() {
+        val l = Layout.portrait(1080, 2400, TileSize.SMALL)
+        val hub = HubBuilder.build(apps.take(5), emptyList(), emptyList(), settings, l)
+        val home = hub.pages[0]
+        // Hero + 4 apps, then the two shortcuts in the next cells, nothing after them.
+        val labels = home.tiles.map { it.label }
+        assertEquals(listOf("App 01", "App 02", "App 03", "App 04", "App 05", "all apps", "settings"), labels.take(7))
+        assertTrue(labels.drop(7).all { it.isEmpty() })
+        assertTrue(home.template.slots[0].h <= Metrics.SMALL_H * 2 + Metrics.GUTTER)
+    }
+
+    @Test fun portraitHubKeepsHeroAndShortcuts() {
+        val l = Layout.portrait(1272, 2772)
+        val hub = HubBuilder.build(apps, emptyList(), emptyList(), settings, l)
+        val home = hub.pages[0]
+        assertEquals(Kind.HERO, home.tiles[home.template.hero].kind)
+        assertEquals("all apps", home.tiles[home.template.wide[0]].label)
+        assertEquals(10, hub.pages[hub.channels.first { it.title == "apps" }.firstPage].tiles.size)
+        // Down from the hero lands on the left tile of the first row.
+        assertEquals(1, Nav.move(l.home.slots, { true }, home.template.hero, 0, 1))
+    }
+
+    @Test fun focusCurveMatchesTimeline() {
+        assertEquals(1.08f, Motion.scale(1f, -1f), 1e-5f)
+        assertEquals(1f, Motion.scale(1f, Metrics.PRESS_DOWN_FRAMES * Metrics.FRAME_MS), 1e-4f)
+        assertEquals(Metrics.FLASH_PEAK, Motion.flash(Metrics.FLASH_PEAK_AT, true), 1e-5f)
+    }
+}

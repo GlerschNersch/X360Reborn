@@ -1,0 +1,651 @@
+package dev.x360reborn.home
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.RadialGradient
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Shader
+import android.graphics.Typeface
+import android.os.SystemClock
+import android.text.TextPaint
+import android.text.TextUtils
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.SoundEffectConstants
+import android.view.ScaleGestureDetector
+import android.view.VelocityTracker
+import android.view.View
+import android.view.ViewConfiguration
+import java.text.DateFormat
+import java.util.Date
+import kotlin.math.abs
+import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+
+/**
+ * The hub: pivot strip ("twist") over a horizon of channel pages, drawn in the dash's 1280x720
+ * design space and fitted to the screen.
+ */
+@SuppressLint("ViewConstructor")
+class HomeView(
+    context: Context,
+    private val onLaunch: (Tile, Rect) -> Unit,
+    private val onLongPress: (Tile) -> Unit,
+    private val iconFor: (String) -> Bitmap?,
+    /** Asked to rebuild the hub when rotation changes the layout. */
+    private val onLayout: (Layout) -> Unit,
+    /** A pinch picked a new tile size (persist it, confirm it). */
+    private val onTileSize: (TileSize) -> Unit,
+) : View(context) {
+
+    var hub: Hub = HubBuilder.build(emptyList(), emptyList(), emptyList(), emptyList())
+        private set
+
+    private val L get() = hub.layout
+
+    /** Layout the current view size wants; the hub catches up via [onLayout]. */
+    var wanted: Layout = Layout.LANDSCAPE
+        private set
+
+    var tileSize = TileSize.LARGE
+        set(v) {
+            if (field == v) return
+            field = v
+            relayout()
+        }
+
+    // Fit transform, design -> screen.
+    private var s = 1f
+    private var ox = 0f
+    private var oy = 0f
+
+    private var scroll = 0f
+    private var scrollFrom = 0f
+    private var scrollTo = 0f
+    private var scrollStart = -1L
+    private val scrollMs = 450f
+
+    private var focusPage = 0
+    private var focusSlot = 1
+    private var twistFocused = false
+    private var twistFocusStart = 0L
+
+    private val focusAnim = HashMap<Int, Float>()
+    private val rising = HashMap<Int, Boolean>()
+    private var pressKey = -1
+    private var pressStart = 0L
+    private var lastFrame = 0L
+
+    private val bgPaint = Paint()
+    private val floorPaint = Paint()
+    private val glowPaint = Paint()
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val shadow = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val light = Typeface.create("sans-serif-light", Typeface.NORMAL)
+    private val twistText = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = Metrics.TEXT; typeface = light; textSize = Metrics.pt(Metrics.TWIST_PT) }
+    private val label = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = Metrics.TEXT; textSize = Metrics.pt(13f) }
+    private val heroPrimary = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = Metrics.TEXT; textSize = Metrics.pt(17f) }
+    private val heroSecondary = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = Metrics.TEXT_DIM; textSize = Metrics.pt(16f) }
+    private val clockText = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = Metrics.TEXT; typeface = light; textSize = Metrics.pt(18f); textAlign = Paint.Align.RIGHT }
+    private val rect = RectF()
+    private val iconRect = RectF()
+    private val clockFormat = DateFormat.getTimeInstance(DateFormat.SHORT)
+
+    init {
+        isFocusable = true
+        isFocusableInTouchMode = true
+    }
+
+    fun setHub(next: Hub) {
+        val title = hub.channels.getOrNull(hub.channelOf(focusPage))?.title
+        val inPage = focusPage - (hub.channels.getOrNull(hub.channelOf(focusPage))?.firstPage ?: 0)
+        // Slot indices mean different cells in another layout, so a relayout refocuses the default.
+        val relaid = next.layout != hub.layout
+        hub = next
+        val ch = next.channels.indexOfFirst { it.title == title }.takeIf { it >= 0 } ?: 0
+        val c = next.channels[ch]
+        focusPage = c.firstPage + min(inPage, c.pageCount - 1)
+        if (relaid || !next.pages[focusPage].focusable(focusSlot)) focusSlot = defaultSlot(focusPage)
+        scroll = focusPage * L.w
+        scrollStart = -1
+        focusAnim.clear()
+        fit()
+        invalidate()
+    }
+
+    private fun defaultSlot(page: Int): Int {
+        val p = hub.pages[page]
+        val hero = p.template.hero
+        if (p.focusable(hero) && p.tiles[hero].kind == Kind.HERO) return hero
+        return Nav.enter(p.template.slots, p::focusable, true, 0f)
+    }
+
+    /** Back/B: return to the home channel, like the dash's Home button. */
+    fun back() {
+        if (twistFocused) { twistFocused = false; invalidate(); return }
+        if (focusPage != 0) goToPage(0, defaultSlot(0))
+    }
+
+    fun refreshClock() = invalidate()
+
+    // ---- layout ------------------------------------------------------------------------------
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) = relayout()
+
+    private fun relayout() {
+        if (width == 0 || height == 0) return
+        val next = Layout.forView(width, height, tileSize)
+        wanted = next
+        fit()
+        if (next != hub.layout) onLayout(next)
+    }
+
+    private fun fit() {
+        if (width == 0 || height == 0) return
+        val w = width
+        val h = height
+        s = min(w / L.w, h / L.h)
+        ox = (w - L.w * s) / 2f
+        oy = (h - L.h * s) / 2f
+        bgPaint.shader = LinearGradient(0f, 0f, 0f, h.toFloat(), Metrics.AURA_STOPS, null, Shader.TileMode.CLAMP)
+        val floorColor = Metrics.FLOOR and 0xFFFFFF
+        floorPaint.shader = LinearGradient(
+            0f, oy, 0f, oy + L.h * s,
+            intArrayOf(floorColor, (0x38 shl 24) or floorColor, (0xCB shl 24) or floorColor, Metrics.FLOOR, Metrics.FLOOR),
+            floatArrayOf(0f, 300f / 720f, 500f / 720f, 600f / 720f, 1f), Shader.TileMode.CLAMP,
+        )
+    }
+
+    private fun pageX(page: Int): Float {
+        val t = hub.pages[page].template
+        return page * L.w - scroll + (L.w - t.w) / 2f
+    }
+
+    private fun pageY(page: Int): Float {
+        val t = hub.pages[page].template
+        return L.panelsY + (L.panelsH - t.h) / 2f
+    }
+
+    /** Continuous channel index under the current scroll, for the twist and the aura pan. */
+    private fun channelPos(): Float {
+        val pf = scroll / L.w
+        val last = hub.pages.size - 1
+        val i0 = floor(pf).toInt().coerceIn(0, last)
+        val i1 = min(i0 + 1, last)
+        val frac = (pf - i0).coerceIn(0f, 1f)
+        val c0 = hub.channelOf(i0)
+        val c1 = hub.channelOf(i1)
+        return c0 + (c1 - c0) * frac
+    }
+
+    // ---- drawing -----------------------------------------------------------------------------
+
+    override fun onDraw(canvas: Canvas) {
+        val now = SystemClock.uptimeMillis()
+        val dt = if (lastFrame == 0L) 16f else min(64f, (now - lastFrame).toFloat())
+        lastFrame = now
+        var animating = stepScroll(now)
+        animating = stepFocus(dt) || animating
+
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
+        val cp = channelPos()
+        drawAura(canvas, cp)
+        canvas.drawRect(0f, oy, width.toFloat(), height.toFloat(), floorPaint)
+
+        canvas.save()
+        canvas.translate(ox, oy)
+        canvas.scale(s, s)
+        val first = max(0, floor(scroll / L.w).toInt() - 1)
+        val last = min(hub.pages.size - 1, first + 3)
+        if (pinchScale != 1f) {
+            canvas.save()
+            canvas.scale(pinchScale, pinchScale, L.w / 2f, L.panelsY + L.panelsH / 2f)
+        }
+        for (p in first..last) drawPage(canvas, p, now)
+        if (pinchScale != 1f) canvas.restore()
+        drawTwist(canvas, cp, now)
+        canvas.drawText(clockFormat.format(Date()), L.clockX, L.clockY, clockText)
+        canvas.restore()
+
+        if (twistFocused) animating = true
+        if (pressKey >= 0 && now - pressStart < Motion.pressDuration) animating = true
+        if (animating) postInvalidateOnAnimation() else lastFrame = 0L
+    }
+
+    private fun drawAura(canvas: Canvas, cp: Float) {
+        // BackgroundImagePanScale 1.3: the aura is 30% wider than the screen and pans across channels.
+        val n = max(1, hub.channels.size - 1)
+        val pan = L.w * (Metrics.PAN_SCALE - 1f)
+        val cx = ox + (L.w / 2f + pan / 2f - pan * cp / n) * s
+        val cy = oy + L.h * 0.36f * s
+        val r = max(L.w, L.h) * 0.56f * s
+        glowPaint.shader = RadialGradient(cx, cy, r, intArrayOf(0x40FFFFFF, 0x00FFFFFF), null, Shader.TileMode.CLAMP)
+        canvas.drawCircle(cx, cy, r, glowPaint)
+    }
+
+    private fun key(page: Int, slot: Int) = page * 64 + slot
+
+    private fun drawPage(canvas: Canvas, page: Int, now: Long) {
+        val p = hub.pages[page]
+        val x0 = pageX(page)
+        val y0 = pageY(page)
+        // Draw the focused tile last so its 1.08x growth overlaps its neighbours.
+        var focusedLast = -1
+        for (i in p.tiles.indices) {
+            if (!p.focusable(i)) continue
+            if ((focusAnim[key(page, i)] ?: 0f) > 0f) { focusedLast = i; continue }
+            drawTile(canvas, p.tiles[i], p.template.slots[i], x0, y0, key(page, i), now)
+        }
+        if (focusedLast >= 0) drawTile(canvas, p.tiles[focusedLast], p.template.slots[focusedLast], x0, y0, key(page, focusedLast), now)
+    }
+
+    private fun drawTile(canvas: Canvas, tile: Tile, b: Box, x0: Float, y0: Float, k: Int, now: Long) {
+        val f = focusAnim[k] ?: 0f
+        val pressMs = if (k == pressKey) (now - pressStart).toFloat() else -1f
+        val sc = Motion.scale(f, pressMs)
+        val x = x0 + b.x
+        val y = y0 + b.y
+        canvas.save()
+        canvas.translate(x + b.w / 2f, y + b.h / 2f)
+        canvas.scale(sc, sc)
+        canvas.translate(-b.w / 2f, -b.h / 2f)
+        rect.set(0f, 0f, b.w, b.h)
+
+        if (f > 0f) {
+            // Shadow nine-grid fades to 0.8 alongside the scale-up.
+            shadow.color = Color.argb((f * 60).roundToInt(), 0, 0, 0)
+            shadow.setShadowLayer(22f, 0f, 6f, Color.argb((Metrics.SHADOW_ALPHA * f * 160).roundToInt(), 0, 0, 0))
+            canvas.drawRect(rect, shadow)
+        }
+
+        when (tile.kind) {
+            Kind.HERO -> drawHero(canvas, tile, b)
+            else -> drawSmall(canvas, tile, b)
+        }
+
+        if (f > 0f) {
+            // focus_state_white.png: a white sheen from the top-left corner.
+            fill.shader = LinearGradient(0f, 0f, b.w * 0.55f, b.h * 0.55f,
+                Color.argb((Metrics.CORNER_ALPHA * f * 255).roundToInt(), 255, 255, 255), 0x00FFFFFF, Shader.TileMode.CLAMP)
+            canvas.drawRect(rect, fill)
+            fill.shader = null
+        }
+        val flash = max(Motion.flash(f, rising[k] == true), Motion.pressFlash(pressMs))
+        if (flash > 0f) {
+            fill.color = Color.argb((flash * 255).roundToInt(), 255, 255, 255)
+            canvas.drawRect(rect, fill)
+        }
+        canvas.restore()
+    }
+
+    private fun drawSmall(canvas: Canvas, tile: Tile, b: Box) {
+        fill.color = Metrics.TILE_GREEN
+        canvas.drawRect(rect, fill)
+        // Glass texture stand-in: soft top highlight over the green.
+        fill.shader = LinearGradient(0f, 0f, 0f, b.h, 0x22FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP)
+        canvas.drawRect(rect, fill)
+        fill.shader = null
+
+        val icon = 56f
+        val ix = (b.w - icon) / 2f
+        val iy = (b.h - 34f - icon) / 2f + 4f
+        drawIcon(canvas, tile, ix, iy, icon)
+        val text = TextUtils.ellipsize(tile.label, label, b.w - 20f, TextUtils.TruncateAt.END)
+        canvas.drawText(text, 0, text.length, 10f, b.h - 12f, label)
+    }
+
+    private fun drawHero(canvas: Canvas, tile: Tile, b: Box) {
+        fill.color = Metrics.SLOT_DARK
+        canvas.drawRect(rect, fill)
+        val icon = min(b.w, b.h) * 0.46f
+        drawIcon(canvas, tile, (b.w - icon) / 2f, b.h * 0.40f - icon / 2f, icon)
+        // mobyslot: gradient from 170/320 of the height, primary 17 pt, secondary 16 pt.
+        fill.shader = LinearGradient(0f, b.h * 170f / 320f, 0f, b.h, 0x00000000, 0xC0000000.toInt(), Shader.TileMode.CLAMP)
+        canvas.drawRect(0f, b.h * 170f / 320f, b.w, b.h, fill)
+        fill.shader = null
+        val primary = TextUtils.ellipsize(tile.label, heroPrimary, b.w - 40f, TextUtils.TruncateAt.END)
+        canvas.drawText(primary, 0, primary.length, 20f, b.h - (if (tile.sub.isEmpty()) 18f else 40f), heroPrimary)
+        if (tile.sub.isNotEmpty()) canvas.drawText(tile.sub, 20f, b.h - 16f, heroSecondary)
+    }
+
+    private fun drawIcon(canvas: Canvas, tile: Tile, x: Float, y: Float, size: Float) {
+        val bmp = tile.iconKey?.let(iconFor)
+        if (bmp != null) {
+            iconRect.set(x, y, x + size, y + size)
+            canvas.drawBitmap(bmp, null, iconRect, bmpPaint)
+            return
+        }
+        fill.color = Metrics.TEXT
+        when (tile.glyph) {
+            Glyph.ALL_APPS -> {
+                val cell = size / 4f
+                for (r in 0 until 3) for (c in 0 until 3) {
+                    val cx = x + size / 8f + c * cell * 1.15f
+                    val cy = y + size / 8f + r * cell * 1.15f
+                    canvas.drawRect(cx, cy, cx + cell * 0.85f, cy + cell * 0.85f, fill)
+                }
+            }
+            Glyph.SETTINGS -> {
+                val cx = x + size / 2f
+                val cy = y + size / 2f
+                fill.style = Paint.Style.STROKE
+                fill.strokeWidth = size * 0.12f
+                canvas.drawCircle(cx, cy, size * 0.26f, fill)
+                fill.style = Paint.Style.FILL
+                for (i in 0 until 8) {
+                    canvas.save()
+                    canvas.rotate(i * 45f, cx, cy)
+                    canvas.drawRect(cx - size * 0.07f, cy - size * 0.46f, cx + size * 0.07f, cy - size * 0.3f, fill)
+                    canvas.restore()
+                }
+            }
+            Glyph.TILE_SIZE -> {
+                // Big square shrinking into a 2x2 of small ones.
+                val g = size * 0.08f
+                val half = (size - g) / 2f
+                fill.alpha = 110
+                canvas.drawRect(x, y, x + size, y + size, fill)
+                fill.alpha = 255
+                for (r in 0 until 2) for (c in 0 until 2) {
+                    if (r == 0 && c == 0) continue
+                    val cx = x + c * (half + g)
+                    val cy = y + r * (half + g)
+                    canvas.drawRect(cx + g, cy + g, cx + half - g, cy + half - g, fill)
+                }
+            }
+            Glyph.NONE -> {}
+        }
+    }
+
+    private val twistBoxes = ArrayList<RectF>()
+
+    private fun drawTwist(canvas: Canvas, cp: Float, now: Long) {
+        val widths = hub.channels.map { twistText.measureText(it.title) + Metrics.TWIST_GAP }
+        val prefix = FloatArray(widths.size + 1)
+        for (i in widths.indices) prefix[i + 1] = prefix[i] + widths[i]
+        val i0 = floor(cp).toInt().coerceIn(0, widths.size - 1)
+        val frac = cp - i0
+        val origin = prefix[i0] + (if (i0 + 1 < widths.size) widths[i0] * frac else 0f)
+        val baseline = L.twistY + Metrics.TWIST_H / 2f - (twistText.ascent() + twistText.descent()) / 2f
+        twistBoxes.clear()
+        for ((i, c) in hub.channels.withIndex()) {
+            val x = L.twistX + prefix[i] - origin
+            twistBoxes += RectF(x, L.twistY, x + widths[i], L.twistY + Metrics.TWIST_H)
+            if (x > L.w || x + widths[i] < -L.twistX) continue
+            val d = min(1f, abs(i - cp))
+            val a = 1f - (1f - Metrics.TWIST_DIM) * d
+            if (twistFocused && i == hub.channelOf(focusPage)) {
+                // Selected glow nine-grid (640x54 at -20,18 inside the 84-high item).
+                val g = Motion.twistGlow((now - twistFocusStart).toFloat())
+                val w = widths[i] - Metrics.TWIST_GAP
+                glowPaint.shader = RadialGradient(x + w / 2f, L.twistY + 45f, w * 0.75f + 20f,
+                    intArrayOf(Color.argb((g * 200).roundToInt(), 255, 255, 255), 0x00FFFFFF), null, Shader.TileMode.CLAMP)
+                canvas.save()
+                canvas.scale(1f, 0.35f, x + w / 2f, L.twistY + 45f)
+                canvas.drawCircle(x + w / 2f, L.twistY + 45f, w * 0.75f + 20f, glowPaint)
+                canvas.restore()
+            }
+            twistText.alpha = (a * 255).roundToInt()
+            canvas.drawText(c.title, x, baseline, twistText)
+        }
+        twistText.alpha = 255
+    }
+
+    // ---- animation ---------------------------------------------------------------------------
+
+    private fun stepScroll(now: Long): Boolean {
+        if (scrollStart < 0) return false
+        val t = (now - scrollStart) / scrollMs
+        scroll = scrollFrom + (scrollTo - scrollFrom) * Motion.easeOut(t)
+        if (t >= 1f) { scroll = scrollTo; scrollStart = -1; return false }
+        return true
+    }
+
+    private fun stepFocus(dt: Float): Boolean {
+        var moving = false
+        val want = if (twistFocused) -1 else key(focusPage, focusSlot)
+        val keys = HashSet(focusAnim.keys)
+        if (want >= 0) keys += want
+        for (k in keys) {
+            val cur = focusAnim[k] ?: 0f
+            val target = if (k == want) 1f else 0f
+            if (cur == target) { if (target == 0f) focusAnim.remove(k); continue }
+            val next = if (target > cur) min(1f, cur + dt * Motion.focusRate) else max(0f, cur - dt * Motion.blurRate)
+            rising[k] = target > cur
+            if (next == 0f) focusAnim.remove(k) else focusAnim[k] = next
+            moving = true
+        }
+        return moving
+    }
+
+    private fun animateScrollTo(page: Int) {
+        scrollFrom = scroll
+        scrollTo = page * L.w
+        scrollStart = SystemClock.uptimeMillis()
+        invalidate()
+    }
+
+    private fun goToPage(page: Int, slot: Int) {
+        focusPage = page
+        focusSlot = slot
+        twistFocused = false
+        animateScrollTo(page)
+    }
+
+    private fun goToChannel(ch: Int, keepTwist: Boolean) {
+        val c = hub.channels[ch.coerceIn(0, hub.channels.size - 1)]
+        goToPage(c.firstPage, defaultSlot(c.firstPage))
+        if (keepTwist) { twistFocused = true }
+        playSoundEffect(SoundEffectConstants.NAVIGATION_RIGHT)
+    }
+
+    // ---- input -------------------------------------------------------------------------------
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_LEFT -> move(-1, 0)
+            KeyEvent.KEYCODE_DPAD_RIGHT -> move(1, 0)
+            KeyEvent.KEYCODE_DPAD_UP -> move(0, -1)
+            KeyEvent.KEYCODE_DPAD_DOWN -> move(0, 1)
+            KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_PAGE_UP -> goToChannel(hub.channelOf(focusPage) - 1, twistFocused)
+            KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_PAGE_DOWN -> goToChannel(hub.channelOf(focusPage) + 1, twistFocused)
+            KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                if (twistFocused) { twistFocused = false; invalidate() } else activate(focusPage, focusSlot)
+            }
+            KeyEvent.KEYCODE_BUTTON_X, KeyEvent.KEYCODE_MENU -> {
+                if (!twistFocused) hub.pages[focusPage].tiles.getOrNull(focusSlot)?.let(onLongPress)
+            }
+            KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_ESCAPE -> back()
+            else -> return super.onKeyDown(keyCode, event)
+        }
+        return true
+    }
+
+    private fun move(dx: Int, dy: Int) {
+        if (twistFocused) {
+            when {
+                dx != 0 -> goToChannel(hub.channelOf(focusPage) + dx, true)
+                dy > 0 -> { twistFocused = false; invalidate() }
+            }
+            return
+        }
+        val p = hub.pages[focusPage]
+        val boxes = p.template.slots
+        val next = if (p.focusable(focusSlot)) Nav.move(boxes, p::focusable, focusSlot, dx, dy) else -1
+        when {
+            next >= 0 -> { focusSlot = next; playSoundEffect(SoundEffectConstants.CLICK); invalidate() }
+            dy < 0 -> { twistFocused = true; twistFocusStart = SystemClock.uptimeMillis(); invalidate() }
+            dx != 0 -> {
+                val target = focusPage + dx
+                if (target !in hub.pages.indices) return
+                val y = if (p.focusable(focusSlot)) boxes[focusSlot].cy else 0f
+                val tp = hub.pages[target]
+                val slot = Nav.enter(tp.template.slots, tp::focusable, dx > 0, y)
+                goToPage(target, if (slot >= 0) slot else 0)
+                playSoundEffect(if (dx > 0) SoundEffectConstants.NAVIGATION_RIGHT else SoundEffectConstants.NAVIGATION_LEFT)
+            }
+        }
+    }
+
+    private fun activate(page: Int, slot: Int) {
+        val p = hub.pages[page]
+        if (!p.focusable(slot)) return
+        val tile = p.tiles[slot]
+        pressKey = key(page, slot)
+        pressStart = SystemClock.uptimeMillis()
+        playSoundEffect(SoundEffectConstants.CLICK)
+        invalidate()
+        when (val t = tile.target) {
+            is Target.Channel -> postDelayed({ goToChannel(t.index, false) }, 150)
+            else -> {
+                val b = p.template.slots[slot]
+                val x = ox + (pageX(page) + b.x) * s
+                val y = oy + (pageY(page) + b.y) * s
+                val r = Rect(x.roundToInt(), y.roundToInt(), (x + b.w * s).roundToInt(), (y + b.h * s).roundToInt())
+                // Let the press dip register before the app covers the hub.
+                postDelayed({ onLaunch(tile, r) }, (Metrics.PRESS_DOWN_FRAMES * Metrics.FRAME_MS).toLong())
+            }
+        }
+    }
+
+    private val slop = ViewConfiguration.get(context).scaledTouchSlop
+    private val longPressMs = ViewConfiguration.getLongPressTimeout().toLong()
+    private var downX = 0f
+    private var downY = 0f
+    private var downScroll = 0f
+    private var dragging = false
+    private var longFired = false
+    private var velocity: VelocityTracker? = null
+    private val longPress = Runnable {
+        longFired = true
+        hitTile(downX, downY)?.let { (page, slot) ->
+            focusPage = page; focusSlot = slot; twistFocused = false; invalidate()
+            performHapticFeedback(HAPTIC_FEEDBACK_ENABLED)
+            onLongPress(hub.pages[page].tiles[slot])
+        }
+    }
+
+    // Pinch in for smaller tiles, out for bigger; the hub scales live, then snaps to the new size.
+    private var pinching = false
+    private var pinchScale = 1f
+    private val pinch = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScaleBegin(d: ScaleGestureDetector): Boolean {
+            pinchScale = 1f
+            return true
+        }
+
+        override fun onScale(d: ScaleGestureDetector): Boolean {
+            pinchScale = (pinchScale * d.scaleFactor).coerceIn(0.6f, 1.5f)
+            invalidate()
+            return true
+        }
+
+        override fun onScaleEnd(d: ScaleGestureDetector) {
+            val next = when {
+                pinchScale < 0.85f -> tileSize.smaller()
+                pinchScale > 1.18f -> tileSize.larger()
+                else -> tileSize
+            }
+            pinchScale = 1f
+            if (next != tileSize) { tileSize = next; onTileSize(next) }
+            invalidate()
+        }
+    })
+
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        pinch.onTouchEvent(e)
+        if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN && !pinching) {
+            pinching = true
+            removeCallbacks(longPress)
+            if (dragging) { dragging = false; goToPage(focusPage, focusSlot) }
+        }
+        if (pinching) {
+            if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) {
+                pinching = false
+                velocity?.recycle(); velocity = null
+            }
+            return true
+        }
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = e.x; downY = e.y; downScroll = scroll
+                dragging = false; longFired = false
+                velocity = VelocityTracker.obtain().also { it.addMovement(e) }
+                postDelayed(longPress, longPressMs)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                velocity?.addMovement(e)
+                if (!dragging && abs(e.x - downX) > slop && abs(e.x - downX) > abs(e.y - downY)) {
+                    dragging = true
+                    removeCallbacks(longPress)
+                    scrollStart = -1
+                }
+                if (abs(e.y - downY) > slop) removeCallbacks(longPress)
+                if (dragging) {
+                    val maxScroll = (hub.pages.size - 1) * L.w
+                    scroll = (downScroll - (e.x - downX) / s).coerceIn(-120f, maxScroll + 120f)
+                    invalidate()
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                removeCallbacks(longPress)
+                val vt = velocity
+                vt?.addMovement(e)
+                vt?.computeCurrentVelocity(1000)
+                val vx = vt?.xVelocity ?: 0f
+                velocity?.recycle(); velocity = null
+                if (dragging) {
+                    val base = (downScroll / L.w).roundToInt()
+                    val moved = (scroll - downScroll) / L.w
+                    val step = when {
+                        vx < -800f || moved > 0.3f -> 1
+                        vx > 800f || moved < -0.3f -> -1
+                        else -> 0
+                    }
+                    val target = (base + step).coerceIn(0, hub.pages.size - 1)
+                    goToPage(target, if (target == focusPage) focusSlot else defaultSlot(target))
+                } else if (!longFired) {
+                    tap(e.x, e.y)
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(longPress)
+                velocity?.recycle(); velocity = null
+                if (dragging) goToPage(focusPage, focusSlot)
+            }
+        }
+        return true
+    }
+
+    private fun toDesign(x: Float, y: Float) = Pair((x - ox) / s, (y - oy) / s)
+
+    private fun hitTile(x: Float, y: Float): Pair<Int, Int>? {
+        val (dx, dy) = toDesign(x, y)
+        val page = (scroll / L.w).roundToInt().coerceIn(0, hub.pages.size - 1)
+        val p = hub.pages[page]
+        val px = dx - pageX(page)
+        val py = dy - pageY(page)
+        for (i in p.template.slots.indices) if (p.focusable(i) && p.template.slots[i].contains(px, py)) return page to i
+        return null
+    }
+
+    private fun tap(x: Float, y: Float) {
+        val (dx, dy) = toDesign(x, y)
+        for ((i, r) in twistBoxes.withIndex()) {
+            if (r.contains(dx, dy)) { goToChannel(i, false); return }
+        }
+        val hit = hitTile(x, y) ?: return
+        focusPage = hit.first; focusSlot = hit.second; twistFocused = false
+        activate(hit.first, hit.second)
+    }
+}
