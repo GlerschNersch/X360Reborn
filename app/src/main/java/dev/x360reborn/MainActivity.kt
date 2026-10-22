@@ -24,6 +24,7 @@ import dev.x360reborn.home.HubBuilder
 import dev.x360reborn.home.Target
 import dev.x360reborn.home.Tile
 import dev.x360reborn.home.TileSize
+import dev.x360reborn.home.Trans
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
@@ -63,12 +64,21 @@ class MainActivity : Activity() {
         onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) { view.back() }
         launcherApps.registerCallback(appsChanged)
         reload()
+        view.play(Trans.TO)
     }
 
     override fun onResume() {
         super.onResume()
         main.post(clock)
+        // Coming back from something we launched: the hub flies back in (TransBackTo).
+        if (leftForApp) {
+            leftForApp = false
+            view.play(Trans.BACK_TO)
+        }
     }
+
+    /** Set when we hand off to another activity, so onResume knows to play the return transition. */
+    private var leftForApp = false
 
     override fun onPause() {
         main.removeCallbacks(clock)
@@ -112,13 +122,16 @@ class MainActivity : Activity() {
             is Target.App -> {
                 val cn = apps.component(t.key) ?: return
                 try {
-                    val opts = ActivityOptions.makeClipRevealAnimation(view, bounds.left, bounds.top, bounds.width(), bounds.height())
+                    // The hub is already zooming away (TransFrom), so the app just fades in over it.
+                    val opts = ActivityOptions.makeCustomAnimation(this, android.R.anim.fade_in, 0)
                     launcherApps.startMainActivity(cn, Process.myUserHandle(), bounds, opts.toBundle())
+                    leftForApp = true
                     apps.markLaunched(t.key)
                     // Rebuild after the app is up, so "recent" reorders while the hub is hidden.
                     main.postDelayed(::reload, 800)
                 } catch (e: Exception) {
                     Log.w(TAG, "launch failed: ${t.key}", e)
+                    view.play(Trans.TO)
                     Toast.makeText(this, "Can't open ${tile.label}", Toast.LENGTH_SHORT).show()
                 }
             }
@@ -126,8 +139,11 @@ class MainActivity : Activity() {
                 view.tileSize = view.tileSize.next()
                 tileSizeChosen(view.tileSize)
             } else try {
-                startActivity(Intent(t.name).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                startActivity(Intent(t.name).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    ActivityOptions.makeCustomAnimation(this, android.R.anim.fade_in, 0).toBundle())
+                leftForApp = true
             } catch (e: ActivityNotFoundException) {
+                view.play(Trans.TO)
                 Toast.makeText(this, "Not available on this device", Toast.LENGTH_SHORT).show()
             }
             is Target.Channel -> {}

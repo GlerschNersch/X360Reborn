@@ -4,6 +4,24 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
+ * hubscene.xur named-frame transitions applied to the whole Hub (twist + panels), pivoting on the
+ * centre. Keys are linear between holds; frames at 60 fps.
+ */
+enum class Trans(val delayF: Float, val durF: Float, val scaleFrom: Float, val scaleTo: Float, val alphaFrom: Float, val alphaTo: Float) {
+    TO(4f, 41f, 0.8f, 1f, 0f, 1f),        // frames 1-46: cold start
+    FROM(0f, 28f, 1f, 1.5f, 1f, 0f),      // frames 47-75: leaving for an app
+    BACK_TO(8f, 42f, 1.5f, 1f, 0f, 1f);   // frames 76-126: returning from an app
+
+    val totalMs get() = (delayF + durF) * Metrics.FRAME_MS
+
+    /** (scale, alpha) at [ms] since the transition started. */
+    fun at(ms: Float): Pair<Float, Float> {
+        val t = ((ms / Metrics.FRAME_MS - delayF) / durF).coerceIn(0f, 1f)
+        return Pair(scaleFrom + (scaleTo - scaleFrom) * t, alphaFrom + (alphaTo - alphaFrom) * t)
+    }
+}
+
+/**
  * Tile focus/press curves from the HubSlotContainer timelines. XUI keyframes here are linear
  * (Interpolation=0), so these are piecewise-linear in frame time.
  */

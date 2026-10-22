@@ -7,7 +7,8 @@ data class AppInfo(val key: String, val label: String, val category: Category = 
 
 sealed interface Target {
     data class App(val key: String) : Target
-    data class Action(val name: String) : Target
+    /** [external] actions open another activity (and play the leave transition); internal ones don't. */
+    data class Action(val name: String, val external: Boolean = true) : Target
     data class Channel(val index: Int) : Target
 }
 
@@ -34,7 +35,13 @@ class Hub(val channels: List<Channel>, val pages: List<Page>, val layout: Layout
     fun channelOf(page: Int) = pages[page].channel
 }
 
-data class SettingsEntry(val label: String, val action: String, val iconKey: String? = null, val glyph: Glyph = Glyph.SETTINGS)
+data class SettingsEntry(
+    val label: String,
+    val action: String,
+    val iconKey: String? = null,
+    val glyph: Glyph = Glyph.SETTINGS,
+    val external: Boolean = true,
+)
 
 object HubBuilder {
     /**
@@ -86,7 +93,7 @@ object HubBuilder {
                 0 -> pages += homePage(layout.home, homeOrder, appsIndex, settingsIndex, heroSub)
                 appsIndex -> pages += gridPages(layout.grid, i, alpha.map(::appTile))
                 settingsIndex -> pages += gridPages(layout.grid, i, settings.map {
-                    Tile(it.label, Target.Action(it.action), iconKey = it.iconKey,
+                    Tile(it.label, Target.Action(it.action, it.external), iconKey = it.iconKey,
                         glyph = if (it.iconKey == null) it.glyph else Glyph.NONE)
                 })
                 else -> pages += contentPages(layout, i, content[i])

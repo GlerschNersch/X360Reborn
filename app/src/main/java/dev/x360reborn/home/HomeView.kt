@@ -204,6 +204,18 @@ class HomeView(
         canvas.save()
         canvas.translate(ox, oy)
         canvas.scale(s, s)
+        val (tScale, tAlpha) = transState(now)
+        if (tAlpha <= 0f) {
+            canvas.drawText(clockFormat.format(Date()), L.clockX, L.clockY, clockText)
+            canvas.restore()
+            if (trans != null) postInvalidateOnAnimation() else lastFrame = 0L
+            return
+        }
+        val transforming = tScale != 1f || tAlpha < 1f
+        if (transforming) {
+            canvas.saveLayerAlpha(0f, 0f, L.w, L.h, (tAlpha * 255).roundToInt())
+            canvas.scale(tScale, tScale, L.w / 2f, L.h / 2f)
+        }
         val first = max(0, floor(scroll / L.w).toInt() - 1)
         val last = min(hub.pages.size - 1, first + 3)
         if (pinchScale != 1f) {
@@ -213,13 +225,50 @@ class HomeView(
         for (p in first..last) drawPage(canvas, p, now)
         if (pinchScale != 1f) canvas.restore()
         drawTwist(canvas, cp, now)
+        if (transforming) canvas.restore()
         canvas.drawText(clockFormat.format(Date()), L.clockX, L.clockY, clockText)
         canvas.restore()
 
+        if (trans != null) animating = true
         if (twistFocused) animating = true
         if (pressKey >= 0 && now - pressStart < Motion.pressDuration) animating = true
         if (animating) postInvalidateOnAnimation() else lastFrame = 0L
     }
+
+    // ---- scene transitions -------------------------------------------------------------------
+
+    private var trans: Trans? = null
+    private var transStart = 0L
+    /** After FROM finishes the hub stays hidden until the next transition brings it back. */
+    private var hidden = false
+
+    fun play(t: Trans) {
+        trans = t
+        transStart = SystemClock.uptimeMillis()
+        hidden = false
+        // Recents reorder while we're away, so the old slot now holds some other app. On home,
+        // come back focused on the hero (the app just used), already lit as the hub flies in.
+        if (t == Trans.BACK_TO && hub.channelOf(focusPage) == 0) {
+            focusSlot = defaultSlot(focusPage)
+            focusAnim.clear()
+            focusAnim[key(focusPage, focusSlot)] = 1f
+        }
+        invalidate()
+    }
+
+    private fun transState(now: Long): Pair<Float, Float> {
+        val t = trans ?: return if (hidden) Pair(1f, 0f) else Pair(1f, 1f)
+        val ms = (now - transStart).toFloat()
+        if (ms >= t.totalMs) {
+            trans = null
+            hidden = t.alphaTo == 0f
+            return Pair(t.scaleTo, t.alphaTo)
+        }
+        return t.at(ms)
+    }
+
+    /** True while the hub is leaving or gone; input is ignored so nothing launches twice. */
+    private val away get() = hidden || trans == Trans.FROM
 
     private fun drawAura(canvas: Canvas, cp: Float) {
         // BackgroundImagePanScale 1.3: the aura is 30% wider than the screen and pans across channels.
@@ -451,6 +500,7 @@ class HomeView(
     // ---- input -------------------------------------------------------------------------------
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (away) return true
         when (keyCode) {
             KeyEvent.KEYCODE_DPAD_LEFT -> move(-1, 0)
             KeyEvent.KEYCODE_DPAD_RIGHT -> move(1, 0)
@@ -504,7 +554,13 @@ class HomeView(
         pressStart = SystemClock.uptimeMillis()
         playSoundEffect(SoundEffectConstants.CLICK)
         invalidate()
-        when (val t = tile.target) {
+        val target = tile.target
+        if (target is Target.Action && !target.external) {
+            // Launcher-internal (tile size): no leave transition, the hub stays put.
+            postDelayed({ onLaunch(tile, Rect()) }, 150)
+            return
+        }
+        when (val t = target) {
             is Target.Channel -> postDelayed({ goToChannel(t.index, false) }, 150)
             else -> {
                 val b = p.template.slots[slot]
@@ -512,9 +568,17 @@ class HomeView(
                 val y = oy + (pageY(page) + b.y) * s
                 val r = Rect(x.roundToInt(), y.roundToInt(), (x + b.w * s).roundToInt(), (y + b.h * s).roundToInt())
                 // Let the press dip register before the app covers the hub.
-                postDelayed({ onLaunch(tile, r) }, (Metrics.PRESS_DOWN_FRAMES * Metrics.FRAME_MS).toLong())
+                // Press dip, then the hub's TransFrom zoom; the app starts partway through it.
+                val dip = (Metrics.PRESS_DOWN_FRAMES * Metrics.FRAME_MS).toLong()
+                postDelayed({ play(Trans.FROM) }, dip)
+                postDelayed({ onLaunch(tile, r) }, dip + LAUNCH_INTO_FROM_MS)
             }
         }
+    }
+
+    private companion object {
+        /** The app opens 12 frames into the 28-frame TransFrom, while the hub is still zooming. */
+        const val LAUNCH_INTO_FROM_MS = 200L
     }
 
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
@@ -563,6 +627,7 @@ class HomeView(
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (away) return true
         pinch.onTouchEvent(e)
         if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN && !pinching) {
             pinching = true

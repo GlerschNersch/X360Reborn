@@ -88,7 +88,7 @@ class Apps(private val context: Context) {
     fun settingsEntries(): List<SettingsEntry> {
         val settingsApp = activities.keys.firstOrNull { it.startsWith("com.android.settings/") }
         return listOf(
-            SettingsEntry("tile size: ${tileSize.label}", ACTION_TILE_SIZE, glyph = Glyph.TILE_SIZE),
+            SettingsEntry("tile size: ${tileSize.label}", ACTION_TILE_SIZE, glyph = Glyph.TILE_SIZE, external = false),
             SettingsEntry("system settings", Settings.ACTION_SETTINGS, settingsApp),
             SettingsEntry("wi-fi", Settings.ACTION_WIFI_SETTINGS),
             SettingsEntry("bluetooth", Settings.ACTION_BLUETOOTH_SETTINGS),

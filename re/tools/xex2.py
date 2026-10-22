@@ -97,7 +97,8 @@ class Xex:
                 if not enc:
                     raise
                 continue
-            if img[:2] == b"MZ":
+            # Unencrypted resource-only modules (huduiskin, XimeDic) carry no PE header.
+            if img[:2] == b"MZ" or not enc:
                 return img
         raise ValueError("could not decrypt image (unknown key?)")
 
@@ -114,6 +115,7 @@ class Xex:
                 pos += ds
             return bytes(out)
         if comp == 2:  # normal: hashed blocks of LZX chunks
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I drops the script dir
             from lzx import LzxDecoder
 
             window = u32(extra, 0)

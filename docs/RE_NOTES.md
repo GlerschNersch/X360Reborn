@@ -72,6 +72,24 @@ Tool: `python -I re/tools/xuitree.py <file.xui> [--timelines]`.
   extra Template1HD columns on home and bigger list pages. Changed by pinch (live preview, snaps at <0.85x / >1.18x) or the
   "tile size" tile in settings.
 
+### Scene transitions (`dash.hubui/hubscene.xur`, timeline on the `Hub` element, pivot 640,360)
+| Named frames | Use | Hold | Ramp (linear) |
+|---|---|---|---|
+| TransTo 1-46 | cold start | 4 f at 0.8x, alpha 0 | 41 f to 1.0x, alpha 1 |
+| TransFrom 47-75 | leaving for an app | none | 28 f to 1.5x, alpha 0 |
+| TransBackTo 76-126 | returning from an app | 8 f at 1.5x, alpha 0 | 42 f to 1.0x, alpha 1 |
+| TransBackFrom 127-156 | (backing out of the hub) | none | 29 f to 0.7x, alpha 0 |
+
+The app plays TO on start, FROM after the press dip (the app opens 12 frames in with a plain fade), and BACK_TO
+on resume after a launch. The system splash is blanked (aura-coloured, no icon) so TO is what you see.
+
+### Flash modules (LZX)
+`re/tools/lzx.py` decodes XEX "normal" compression (CAB-style LZX: 32 KiB frames, 24-bit block sizes,
+16-bit realignment per frame). Verified on bootanim, xam (6 MB, ~2 s), hud, huduiskin.
+- `bootanim.dll` ("Xbox360 Startup Animation") renders the boot animation in code (D3D), so there are no frames
+  to measure. Its `audio` resource is the startup sound (XMA2, 48 kHz): Microsoft's, never shipped.
+- `xam` holds the Guide XUI (`skin`, `xam`, `shrdres`, `gamercrd`…); `huduiskin` is resource-only (no PE header).
+
 ## Next
 - LZX for flash modules (xam Guide skin, bootanim boot animation).
 - Twist focus glow and channel-switch timing against real footage; Kinect/hover chrome not built.

@@ -113,6 +113,18 @@ class HubTest {
         assertEquals(1, Nav.move(l.home.slots, { true }, home.template.hero, 0, 1))
     }
 
+    @Test fun sceneTransitionsMatchHubsceneTimeline() {
+        val f = Metrics.FRAME_MS
+        // TransTo: held at 0.8/transparent for 4 frames, then linear to 1.0/opaque by frame 45.
+        assertEquals(Pair(0.8f, 0f), dev.x360reborn.home.Trans.TO.at(3 * f))
+        val mid = dev.x360reborn.home.Trans.TO.at((4 + 20.5f) * f)
+        assertEquals(0.9f, mid.first, 1e-4f)
+        assertEquals(0.5f, mid.second, 1e-4f)
+        assertEquals(Pair(1.5f, 0f), dev.x360reborn.home.Trans.FROM.at(28 * f))
+        assertEquals(Pair(1f, 1f), dev.x360reborn.home.Trans.BACK_TO.at(50 * f))
+        assertEquals(750f, dev.x360reborn.home.Trans.TO.totalMs, 0.01f)
+    }
+
     @Test fun focusCurveMatchesTimeline() {
         assertEquals(1.08f, Motion.scale(1f, -1f), 1e-5f)
         assertEquals(1f, Motion.scale(1f, Metrics.PRESS_DOWN_FRAMES * Metrics.FRAME_MS), 1e-4f)
