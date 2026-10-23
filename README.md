@@ -6,6 +6,15 @@ It is a clean-room rebuild. Layout sizes, colours and animation timings were mea
 dashboard's own UI scenes (see [docs/RE_NOTES.md](docs/RE_NOTES.md)), but no Microsoft code, images,
 sounds or fonts are included. All graphics are drawn in code.
 
+## Install
+
+1. Download `X360Reborn-<version>.apk` from [Releases](../../releases).
+2. Open it on your phone and allow installing from that source when Android asks.
+3. Press Home and choose **X360 Reborn**. To change it later, go to Settings → Apps → Default apps → Home app.
+
+Requires Android 13 or newer. Release APKs are signed with the Reborn release key, so a release won't
+install over a build you made yourself with the debug key; uninstall that one first.
+
 ## Features
 
 - Pivot strip ("home / games / tv & movies / music / apps / settings") over swipeable channel pages
